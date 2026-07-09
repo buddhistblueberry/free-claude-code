@@ -1,0 +1,111 @@
+# Build Free Claude Code for Termux (android-24-arm64_v8a)
+#
+# Runs a native aarch64 Termux environment via QEMU + Docker,
+# then builds everything inside it. Simple, reliable, works.
+
+name: Build Termux
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['termux-v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build termux wheels
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build everything inside Termux aarch64
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v $PWD:/workspace \
+            -w /workspace \
+            termux/termux-docker:aarch64 \
+            bash -c '
+              set -e
+
+              echo "==> [1/6] Updating Termux..."
+              apt-get update -qq
+              apt-get upgrade -y -qq
+
+              echo "==> [2/6] Installing build deps (Python, Rust, Clang)..."
+              apt-get install -y -qq python python-pip rust clang binutils make
+
+              echo "==> [3/6] Installing uv..."
+              pip install uv -q
+
+              echo "==> [4/6] Building free-claude-code (this compiles Rust/C extensions)..."
+              uv tool install . 2>&1
+
+              echo "==> [5/6] Collecting wheels..."
+              mkdir -p /workspace/wheelhouse
+
+              # Build the top-level wheel
+              pip install build wheel -q
+              python -m build --wheel --outdir /workspace/wheelhouse . 2>&1
+
+              # Build dependency wheels for offline install
+              # Only include deps that are not pure-Python (have native extensions)
+              pip download --only-binary=:all: --platform manylinux_2_17_x86_64 \
+                -d /dev/null 2>/dev/null || true
+
+              # Download all wheels for the Termux platform
+              pip wheel -w /workspace/wheelhouse . 2>&1 || true
+
+              echo "==> [6/6] Done!"
+              echo "Wheels:"
+              ls -lh /workspace/wheelhouse/
+            '
+        timeout-minutes: 110
+
+      - name: Create install script
+        run: |
+          cat > wheelhouse/install-termux.sh << 'SCRIPT'
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -e
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          echo "==> Installing Free Claude Code for Termux..."
+          pip install --no-index --find-links "$DIR" free-claude-code 2>&1
+          echo ""
+          echo "==> Done! Start with: fcc-server"
+          echo "==> Open admin UI: http://127.0.0.1:8082/admin"
+          SCRIPT
+          chmod +x wheelhouse/install-termux.sh
+
+      - name: Upload wheelhouse
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-wheels
+          path: wheelhouse/
+          retention-days: 90
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/termux-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wheelhouse/*
+          body: |
+            Prebuilt wheels for Termux (android-24-arm64_v8a).
+            Download from Artifacts, then:
+            ```bash
+            unzip termux-wheels.zip -d ~/fcc-wheels
+            cd ~/fcc-wheels
+            bash install-termux.sh
+            fcc-server
+            ```
